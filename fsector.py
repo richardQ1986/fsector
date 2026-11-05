@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Fsector - Pentest tools over Tor
@@ -32,11 +33,12 @@ except ImportError:
 
 
 APP_NAME = "Fsector"
-VERSION = "1.3"
+VERSION = "1.4"
 
 TOR_SOCKS_HOST = "127.0.0.1"
 TOR_SOCKS_PORT = 9050
 TOR_CONTROL_PORT = 9051
+TOR_COOKIE_PATH = "/var/run/tor/control.authcookie"
 TOR_STARTUP_TIMEOUT = 30
 ROTATION_WAIT = 15
 SENSITIVE_PORTS = {"22", "23", "445", "3389", "3306", "5432", "6379", "9200", "27017"}
@@ -84,7 +86,6 @@ SCAN_PLANS = {
 }
 
 
-# ---------- Data models ----------
 @dataclass
 class PortResult:
     port: str
@@ -102,11 +103,8 @@ class ScanSummary:
     ports: list = field(default_factory=list)
 
 
-# ---------- Animated banner ----------
 def show_banner_animated() -> None:
-    """Reveal the banner left-to-right, line by line."""
     lines = BANNER.strip("\n").split("\n")
-    
     with Live(console=console, refresh_per_second=30, transient=False) as live:
         for i, line in enumerate(lines):
             for j in range(0, len(line) + 1, 8):
@@ -114,7 +112,6 @@ def show_banner_animated() -> None:
                 live.update(Text(partial, style="bold cyan"))
                 time.sleep(0.012)
         live.update(Text("\n".join(lines), style="bold cyan"))
-    
     console.print(Text.assemble(
         ("  🧅 ", "bold"),
         (APP_NAME, "bold cyan"),
@@ -125,7 +122,6 @@ def show_banner_animated() -> None:
     console.print()
 
 
-# ---------- Preflight ----------
 def check_binary(name: str) -> bool:
     return shutil.which(name) is not None
 
@@ -141,7 +137,6 @@ def preflight() -> bool:
     return ok
 
 
-# ---------- Tor helpers ----------
 def port_is_open(host: str, port: int, timeout: float = 1.0) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -187,7 +182,6 @@ def start_tor() -> Optional[subprocess.Popen]:
 
 
 def ensure_control_port() -> bool:
-    """Check ControlPort; if closed, offer to auto-enable via /etc/tor/torrc."""
     if port_is_open(TOR_SOCKS_HOST, TOR_CONTROL_PORT, timeout=1.0):
         return True
 
@@ -209,19 +203,27 @@ def ensure_control_port() -> bool:
         console.print(f"  [red]✗[/] {torrc} not found")
         return False
 
+    has_control = any(
+        line.strip().startswith("ControlPort") and not line.strip().startswith("#")
+        for line in content.splitlines()
+    )
+    has_cookie = any(
+        line.strip().startswith("CookieAuthentication") and not line.strip().startswith("#")
+        for line in content.splitlines()
+    )
+
     changed = False
-    if "ControlPort 9051" not in content:
+    if not has_control:
         content += "\nControlPort 9051\n"
         changed = True
-    if "CookieAuthentication 1" not in content:
+    if not has_cookie:
         content += "CookieAuthentication 1\n"
         changed = True
 
     if not changed:
-        console.print("  [dim]Lines exist, restarting tor...[/]")
-        subprocess.run(["systemctl", "restart", "tor"], check=False)
-        time.sleep(3)
-        return port_is_open(TOR_SOCKS_HOST, TOR_CONTROL_PORT, timeout=2.0)
+        console.print("  [yellow]![/] Lines seem present but port still closed.")
+        console.print("  [dim]Check /etc/tor/torrc manually and restart tor.[/]")
+        return False
 
     try:
         shutil.copy(torrc, torrc + ".fsector.bak")
@@ -229,7 +231,13 @@ def ensure_control_port() -> bool:
             f.write(content)
         console.print("  [green]✓[/] /etc/tor/torrc updated (backup: .fsector.bak)")
         console.print("  [dim]Restarting tor...[/]")
-        subprocess.run(["systemctl", "restart", "tor"], check=False)
+        result = subprocess.run(
+            ["systemctl", "restart", "tor"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            console.print(f"  [red]✗[/] systemctl failed: {result.stderr.strip()[:200]}")
+            return False
         time.sleep(3)
 
         if port_is_open(TOR_SOCKS_HOST, TOR_CONTROL_PORT, timeout=2.0):
@@ -243,12 +251,35 @@ def ensure_control_port() -> bool:
 
 
 def send_newnym() -> bool:
+    """Authenticate with Tor using cookie file, then send NEWNYM."""
     try:
-        with socket.create_connection((TOR_SOCKS_HOST, TOR_CONTROL_PORT), timeout=2) as s:
-            s.sendall(b"AUTHENTICATE\r\nSIGNAL NEWNYM\r\nQUIT\r\n")
-            time.sleep(0.5)
+        with open(TOR_COOKIE_PATH, "rb") as f:
+            cookie_bytes = f.read()
+
+        if len(cookie_bytes) != 32:
+            console.print(f"  [red]✗[/] Cookie size is {len(cookie_bytes)}, expected 32")
+            return False
+
+        cookie_hex = cookie_bytes.hex()
+    except PermissionError:
+        console.print("  [red]✗[/] Permission denied reading cookie. Run with sudo.")
+        return False
+    except FileNotFoundError:
+        # No cookie — try passwordless AUTHENTICATE (works if auth is disabled)
+        console.print("  [dim]No cookie file, trying passwordless auth...[/]")
+        cookie_hex = ""
+
+    try:
+        with socket.create_connection((TOR_SOCKS_HOST, TOR_CONTROL_PORT), timeout=3) as s:
+            if cookie_hex:
+                cmd = f"AUTHENTICATE {cookie_hex}\r\nSIGNAL NEWNYM\r\nQUIT\r\n"
+            else:
+                cmd = "AUTHENTICATE\r\nSIGNAL NEWNYM\r\nQUIT\r\n"
+            s.sendall(cmd.encode())
+            time.sleep(2)
         return True
-    except OSError:
+    except OSError as e:
+        console.print(f"  [red]✗[/] Socket error: {e}")
         return False
 
 
@@ -281,17 +312,16 @@ def rotate_and_wait(wait_seconds: int = ROTATION_WAIT) -> tuple:
 
 
 def get_exit_ip() -> str:
-    """Try multiple services to get Tor exit IP."""
     endpoints = [
+        "https://icanhazip.com",
         "https://ifconfig.me/ip",
         "https://api.ipify.org",
-        "https://icanhazip.com",
         "https://check.torproject.org/api/ip",
     ]
     for url in endpoints:
         try:
             out = subprocess.check_output(
-                ["curl", "-s", "--max-time", "8",
+                ["curl", "-s", "--max-time", "30",
                  "--socks5-hostname", f"{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}",
                  url],
                 stderr=subprocess.DEVNULL,
@@ -312,7 +342,6 @@ def get_exit_ip() -> str:
     return "unknown"
 
 
-# ---------- proxychains config ----------
 def write_proxychains_conf() -> str:
     fd, path = tempfile.mkstemp(prefix="fsector_", suffix=".conf")
     with os.fdopen(fd, "w") as f:
@@ -328,7 +357,6 @@ def write_proxychains_conf() -> str:
     return path
 
 
-# ---------- nmap parsing ----------
 def parse_nmap_xml(xml_str: str) -> list:
     root = ET.fromstring(xml_str)
     results = []
@@ -355,7 +383,6 @@ def parse_nmap_xml(xml_str: str) -> list:
     return results
 
 
-# ---------- Run nmap ----------
 def run_nmap_via_tor(target: str, conf_path: str, plan: dict) -> tuple:
     cmd = [
         "proxychains4", "-f", conf_path, "-q",
@@ -402,7 +429,6 @@ def run_nmap_via_tor(target: str, conf_path: str, plan: dict) -> tuple:
     return results, elapsed
 
 
-# ---------- Rendering ----------
 def style_state(state: str) -> str:
     return {
         "open":          "[bold green]🟢 open[/]",
@@ -462,7 +488,6 @@ def render_table(summary: ScanSummary) -> None:
     console.print(table)
 
 
-# ---------- Menu ----------
 def choose_tool() -> str:
     table = Table(
         show_header=True,
@@ -506,7 +531,6 @@ def choose_plan() -> dict:
     return plan
 
 
-# ---------- Main ----------
 def main() -> int:
     show_banner_animated()
 
@@ -551,7 +575,6 @@ def main() -> int:
             console.print("[red]✗ Empty target[/]")
             return 1
 
-        # Strip accidental URL prefixes
         for prefix in ("https://", "http://"):
             if target.startswith(prefix):
                 target = target[len(prefix):].rstrip("/")
