@@ -24,6 +24,7 @@ try:
         Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn,
     )
     from rich.text import Text
+    from rich.live import Live
     from rich import box
 except ImportError:
     print("[!] Missing dependency: rich\n    pip install rich", file=sys.stderr)
@@ -31,7 +32,7 @@ except ImportError:
 
 
 APP_NAME = "Fsector"
-VERSION = "1.2"
+VERSION = "1.3"
 
 TOR_SOCKS_HOST = "127.0.0.1"
 TOR_SOCKS_PORT = 9050
@@ -52,10 +53,38 @@ BANNER = r"""
 """
 
 TOOLS = {
-    "1": {"name": "nmap", "desc": "TCP connect port & service scanner (via Tor)"},
+    "1": {"name": "nmap", "desc": "Port & service scanner (via Tor)"},
+}
+
+SCAN_PLANS = {
+    "1": {
+        "name": "Paranoid (T0) - Maximum stealth",
+        "flags": ["-T0", "--max-parallelism", "1", "-p", "22,80,443,3389"],
+        "desc": "Slowest, minimal noise. May take hours. Best for strict IDS.",
+        "warning": "This scan can take HOURS. Only use on small port sets.",
+    },
+    "2": {
+        "name": "Sneaky (T1) - Very stealthy",
+        "flags": ["-T1", "--max-parallelism", "1", "--top-ports", "100"],
+        "desc": "15s delay per probe. Good balance of stealth and time.",
+        "warning": None,
+    },
+    "3": {
+        "name": "Polite (T2) - Balanced",
+        "flags": ["-T2", "--top-ports", "100"],
+        "desc": "Low bandwidth, less aggressive. Reasonable for Tor.",
+        "warning": None,
+    },
+    "4": {
+        "name": "Aggressive (T4) - Fast",
+        "flags": ["-T4", "--top-ports", "1000"],
+        "desc": "Faster, more noise. Simulates an impatient attacker.",
+        "warning": "This generates more traffic and may trigger IDS alerts.",
+    },
 }
 
 
+# ---------- Data models ----------
 @dataclass
 class PortResult:
     port: str
@@ -73,8 +102,19 @@ class ScanSummary:
     ports: list = field(default_factory=list)
 
 
-def show_banner() -> None:
-    console.print(Text(BANNER.strip("\n"), style="bold cyan"), justify="left")
+# ---------- Animated banner ----------
+def show_banner_animated() -> None:
+    """Reveal the banner left-to-right, line by line."""
+    lines = BANNER.strip("\n").split("\n")
+    
+    with Live(console=console, refresh_per_second=30, transient=False) as live:
+        for i, line in enumerate(lines):
+            for j in range(0, len(line) + 1, 8):
+                partial = "\n".join(lines[:i] + [line[:j]])
+                live.update(Text(partial, style="bold cyan"))
+                time.sleep(0.012)
+        live.update(Text("\n".join(lines), style="bold cyan"))
+    
     console.print(Text.assemble(
         ("  🧅 ", "bold"),
         (APP_NAME, "bold cyan"),
@@ -85,6 +125,7 @@ def show_banner() -> None:
     console.print()
 
 
+# ---------- Preflight ----------
 def check_binary(name: str) -> bool:
     return shutil.which(name) is not None
 
@@ -100,6 +141,7 @@ def preflight() -> bool:
     return ok
 
 
+# ---------- Tor helpers ----------
 def port_is_open(host: str, port: int, timeout: float = 1.0) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -144,6 +186,62 @@ def start_tor() -> Optional[subprocess.Popen]:
     return proc
 
 
+def ensure_control_port() -> bool:
+    """Check ControlPort; if closed, offer to auto-enable via /etc/tor/torrc."""
+    if port_is_open(TOR_SOCKS_HOST, TOR_CONTROL_PORT, timeout=1.0):
+        return True
+
+    console.print("  [yellow]![/] ControlPort :9051 not open")
+    console.print("  [dim]IP rotation and exit IP display need this.[/]")
+
+    if os.geteuid() != 0:
+        console.print("  [dim]Tip: run with sudo to enable it automatically.[/]")
+        return False
+
+    if not Confirm.ask("  Auto-enable ControlPort in /etc/tor/torrc?", default=True):
+        return False
+
+    torrc = "/etc/tor/torrc"
+    try:
+        with open(torrc, "r") as f:
+            content = f.read()
+    except FileNotFoundError:
+        console.print(f"  [red]✗[/] {torrc} not found")
+        return False
+
+    changed = False
+    if "ControlPort 9051" not in content:
+        content += "\nControlPort 9051\n"
+        changed = True
+    if "CookieAuthentication 1" not in content:
+        content += "CookieAuthentication 1\n"
+        changed = True
+
+    if not changed:
+        console.print("  [dim]Lines exist, restarting tor...[/]")
+        subprocess.run(["systemctl", "restart", "tor"], check=False)
+        time.sleep(3)
+        return port_is_open(TOR_SOCKS_HOST, TOR_CONTROL_PORT, timeout=2.0)
+
+    try:
+        shutil.copy(torrc, torrc + ".fsector.bak")
+        with open(torrc, "w") as f:
+            f.write(content)
+        console.print("  [green]✓[/] /etc/tor/torrc updated (backup: .fsector.bak)")
+        console.print("  [dim]Restarting tor...[/]")
+        subprocess.run(["systemctl", "restart", "tor"], check=False)
+        time.sleep(3)
+
+        if port_is_open(TOR_SOCKS_HOST, TOR_CONTROL_PORT, timeout=2.0):
+            console.print("  [green]✓[/] ControlPort now open")
+            return True
+        console.print("  [red]✗[/] Port still closed after restart")
+        return False
+    except Exception as e:
+        console.print(f"  [red]✗[/] Failed: {e}")
+        return False
+
+
 def send_newnym() -> bool:
     try:
         with socket.create_connection((TOR_SOCKS_HOST, TOR_CONTROL_PORT), timeout=2) as s:
@@ -183,18 +281,38 @@ def rotate_and_wait(wait_seconds: int = ROTATION_WAIT) -> tuple:
 
 
 def get_exit_ip() -> str:
-    try:
-        out = subprocess.check_output(
-            ["curl", "-s", "--max-time", "10",
-             "--socks5-hostname", f"{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}",
-             "https://check.torproject.org/api/ip"],
-            stderr=subprocess.DEVNULL,
-        )
-        return json.loads(out).get("IP", "unknown")
-    except Exception:
-        return "unknown"
+    """Try multiple services to get Tor exit IP."""
+    endpoints = [
+        "https://ifconfig.me/ip",
+        "https://api.ipify.org",
+        "https://icanhazip.com",
+        "https://check.torproject.org/api/ip",
+    ]
+    for url in endpoints:
+        try:
+            out = subprocess.check_output(
+                ["curl", "-s", "--max-time", "8",
+                 "--socks5-hostname", f"{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}",
+                 url],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+
+            if out.startswith("{"):
+                try:
+                    data = json.loads(out)
+                    ip = data.get("IP") or data.get("ip")
+                    if ip and ip != "unknown":
+                        return ip
+                except json.JSONDecodeError:
+                    pass
+            elif out and len(out) < 64 and "." in out:
+                return out
+        except Exception:
+            continue
+    return "unknown"
 
 
+# ---------- proxychains config ----------
 def write_proxychains_conf() -> str:
     fd, path = tempfile.mkstemp(prefix="fsector_", suffix=".conf")
     with os.fdopen(fd, "w") as f:
@@ -210,6 +328,7 @@ def write_proxychains_conf() -> str:
     return path
 
 
+# ---------- nmap parsing ----------
 def parse_nmap_xml(xml_str: str) -> list:
     root = ET.fromstring(xml_str)
     results = []
@@ -236,12 +355,13 @@ def parse_nmap_xml(xml_str: str) -> list:
     return results
 
 
-def run_nmap_via_tor(target: str, conf_path: str) -> tuple:
+# ---------- Run nmap ----------
+def run_nmap_via_tor(target: str, conf_path: str, plan: dict) -> tuple:
     cmd = [
         "proxychains4", "-f", conf_path, "-q",
-        "nmap", "-sT", "-Pn", "-T4",
-        "--top-ports", "100",
-        "-oX", "-", target,
+        "nmap", "-sT", "-Pn", "-oX", "-",
+        *plan["flags"],
+        target,
     ]
     console.print(f"[dim]$ {' '.join(cmd)}[/]")
 
@@ -256,7 +376,7 @@ def run_nmap_via_tor(target: str, conf_path: str) -> tuple:
             transient=True,
         ) as progress:
             progress.add_task("scan", total=None)
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
     except subprocess.TimeoutExpired:
         console.print("[red]✗ Scan timed out[/]")
         return [], time.time() - start
@@ -282,6 +402,7 @@ def run_nmap_via_tor(target: str, conf_path: str) -> tuple:
     return results, elapsed
 
 
+# ---------- Rendering ----------
 def style_state(state: str) -> str:
     return {
         "open":          "[bold green]🟢 open[/]",
@@ -341,6 +462,7 @@ def render_table(summary: ScanSummary) -> None:
     console.print(table)
 
 
+# ---------- Menu ----------
 def choose_tool() -> str:
     table = Table(
         show_header=True,
@@ -359,8 +481,34 @@ def choose_tool() -> str:
     return TOOLS[choice]["name"]
 
 
+def choose_plan() -> dict:
+    table = Table(
+        show_header=True,
+        header_style="bold magenta",
+        border_style="bright_blue",
+        box=box.SIMPLE,
+    )
+    table.add_column("#", justify="center", style="cyan")
+    table.add_column("Plan", style="bold")
+    table.add_column("Description", style="dim")
+    for key, plan in SCAN_PLANS.items():
+        table.add_row(key, plan["name"], plan["desc"])
+
+    console.print(table)
+    choice = Prompt.ask("Select plan [cyan]number[/]", choices=list(SCAN_PLANS.keys()))
+    plan = SCAN_PLANS[choice]
+
+    if plan["warning"]:
+        console.print(f"  [yellow]⚠ {plan['warning']}[/]")
+        if not Confirm.ask("  Continue?", default=False):
+            return choose_plan()
+
+    return plan
+
+
+# ---------- Main ----------
 def main() -> int:
-    show_banner()
+    show_banner_animated()
 
     console.rule("[bold cyan]1/6 · Preflight")
     if not preflight():
@@ -375,53 +523,71 @@ def main() -> int:
         return 1
 
     try:
-        console.rule("[bold cyan]3/6 · Initial identity")
-        if send_newnym():
+        console.rule("[bold cyan]3/6 · ControlPort & identity")
+        control_ok = ensure_control_port()
+
+        if control_ok and send_newnym():
             console.print("  [green]✓[/] NEWNYM signal sent")
         else:
-            console.print("  [yellow]![/] ControlPort unavailable (skipping)")
+            console.print("  [yellow]![/] IP rotation disabled (ControlPort unavailable)")
 
         current_ip = get_exit_ip()
-        console.print(f"  [green]✓[/] Current exit IP: [magenta]{current_ip}[/]")
+        if current_ip != "unknown":
+            console.print(f"  [green]✓[/] Current exit IP: [magenta]{current_ip}[/]")
+        else:
+            console.print("  [yellow]![/] Could not determine exit IP")
 
         console.rule("[bold cyan]4/6 · Configure scan")
         tool = choose_tool()
-        target = Prompt.ask("  Target [cyan](IP or domain)[/]").strip()
+
+        plan = None
+        if tool == "nmap":
+            console.print("\n  [bold]Select scan plan:[/]")
+            plan = choose_plan()
+            console.print(f"  [green]✓[/] Plan: [cyan]{plan['name']}[/]")
+
+        target = Prompt.ask("  Target [cyan](IP or domain, no https://)[/]").strip()
         if not target:
             console.print("[red]✗ Empty target[/]")
             return 1
 
+        # Strip accidental URL prefixes
+        for prefix in ("https://", "http://"):
+            if target.startswith(prefix):
+                target = target[len(prefix):].rstrip("/")
+                console.print(f"  [dim]→ using {target}[/]")
+
         console.rule("[bold cyan]5/6 · Rotate identity before scan?")
-        console.print(
-            f"  [dim]A fresh Tor circuit gives a new exit IP, but it takes "
-            f"~{ROTATION_WAIT}s to build.[/]"
-        )
-        do_rotate = Confirm.ask(
-            f"  Rotate IP now and wait {ROTATION_WAIT}s before scanning?",
-            default=True,
-        )
+        if control_ok:
+            console.print(
+                f"  [dim]A fresh Tor circuit gives a new exit IP, "
+                f"but it takes ~{ROTATION_WAIT}s to build.[/]"
+            )
+            do_rotate = Confirm.ask(
+                f"  Rotate IP now and wait {ROTATION_WAIT}s before scanning?",
+                default=True,
+            )
 
-        if do_rotate:
-            console.print("  [dim]Requesting new identity from Tor...[/]")
-            success, old_ip, new_ip = rotate_and_wait(ROTATION_WAIT)
+            if do_rotate:
+                console.print("  [dim]Requesting new identity from Tor...[/]")
+                success, old_ip, new_ip = rotate_and_wait(ROTATION_WAIT)
 
-            if not success:
-                console.print("  [red]✗[/] Rotation failed (ControlPort unreachable)")
-                if not Confirm.ask("  Continue scan with current IP anyway?", default=False):
-                    return 1
-            elif old_ip == new_ip and new_ip != "unknown":
-                console.print(
-                    f"  [yellow]![/] Tor reused the same exit IP: [magenta]{new_ip}[/]"
-                )
-                console.print("  [dim](Tor may be under rate-limit; continuing anyway)[/]")
+                if not success:
+                    console.print("  [red]✗[/] Rotation failed")
+                    if not Confirm.ask("  Continue with current IP?", default=True):
+                        return 1
+                elif old_ip == new_ip and new_ip != "unknown":
+                    console.print(f"  [yellow]![/] Tor reused IP: {new_ip}")
+                else:
+                    console.print(
+                        f"  [green]✓[/] Exit IP changed: "
+                        f"[dim]{old_ip}[/] → [magenta]{new_ip}[/]"
+                    )
+                    current_ip = new_ip
             else:
-                console.print(
-                    f"  [green]✓[/] Exit IP changed: "
-                    f"[dim]{old_ip}[/] → [magenta]{new_ip}[/]"
-                )
-                current_ip = new_ip
+                console.print(f"  [dim]Using current IP {current_ip}[/]")
         else:
-            console.print(f"  [dim]Skipping rotation, using current IP {current_ip}[/]")
+            console.print("  [dim]Skipping rotation (ControlPort unavailable)[/]")
 
         if not Confirm.ask(
             f"\n  Run [bold]{tool}[/] against [bold]{target}[/] via Tor?",
@@ -433,7 +599,7 @@ def main() -> int:
         console.rule("[bold cyan]6/6 · Executing")
         conf = write_proxychains_conf()
         try:
-            ports, elapsed = run_nmap_via_tor(target, conf)
+            ports, elapsed = run_nmap_via_tor(target, conf, plan)
         finally:
             try:
                 os.unlink(conf)
@@ -454,6 +620,7 @@ def main() -> int:
             with open(out_path, "w") as f:
                 json.dump({
                     "tool": "nmap",
+                    "plan": plan["name"] if plan else None,
                     "target": summary.target,
                     "exit_ip": summary.exit_ip,
                     "elapsed": round(summary.elapsed, 2),
