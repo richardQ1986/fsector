@@ -47,3 +47,17 @@ It is **not** a magic invisibility cloak — it is a carefully engineered tool t
 
 <img width="1280" height="771" alt="fsector terminal" src="https://github.com/user-attachments/assets/d737a772-b04a-473a-9485-2c76c5619dea" />
 
+## ⚠️ Legal Disclaimer & Terms of Use
+
+**Fsector is provided for educational, authorized penetration testing, and defensive security purposes only.**
+
+By downloading, installing, or using this software, you explicitly agree to the following terms:
+
+1.  **No Warranty (AS IS):** This software is provided "AS IS", without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and noninfringement [citation:1][citation:2]. The author(s) make no guarantees regarding the accuracy, reliability, or safety of this tool.
+2.  **User Responsibility:** You, the end-user, are solely responsible for your actions and any consequences that arise from the use of this software. You must ensure that you have explicit, written permission to scan or test any network, system, or application. Unauthorized scanning is illegal in most jurisdictions and may violate local and international laws.
+3.  **Limitation of Liability:** In no event shall the author(s) or copyright holder(s) be liable for any claim, damages, or other liability, whether in an action of contract, tort, or otherwise, arising from, out of, or in connection with the software or the use or other dealings in the software [citation:1][citation:6]. This includes, but is not limited to, legal fees, criminal charges, or any damage caused to target systems.
+4.  **Indemnification:** You agree to indemnify, defend, and hold harmless the author(s) from and against any and all claims, liabilities, damages, losses, or expenses (including reasonable attorneys' fees) arising out of or in any way connected with your access to or use of this software.
+
+**The author(s) do not condone, encourage, or support any illegal activity. This tool is a technical instrument, and like any instrument, its ethical and legal use depends entirely on the user.**
+
+**If you are unsure about the legality of your actions, do not use this tool.**
