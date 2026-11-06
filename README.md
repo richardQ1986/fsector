@@ -1,5 +1,10 @@
 <div align="center">
 
+
+
+<img width="1280" height="480" alt="msg69078375-16411" src="https://github.com/user-attachments/assets/24dbb361-354d-4267-98fa-68d4ebd240d5" />
+
+
 # 🧅 Fsector
 
 **Pentest tools over Tor — with stealth scan plans and a beautiful terminal UI.**
