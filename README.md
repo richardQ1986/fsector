@@ -61,3 +61,32 @@ By downloading, installing, or using this software, you explicitly agree to the 
 **The author(s) do not condone, encourage, or support any illegal activity. This tool is a technical instrument, and like any instrument, its ethical and legal use depends entirely on the user.**
 
 **If you are unsure about the legality of your actions, do not use this tool.**
+
+---
+
+## 📬 Contact & Support
+
+If you have any questions, suggestions, or have discovered a security vulnerability in this tool, please feel free to reach out:
+
+- **GitHub Issues:** [Open an issue](https://github.com/richardQ1986/fsector/issues)
+- **Developer:** [richardQ1986](https://github.com/richardQ1986)
+
+---
+
+## 🏁 Final Note
+
+**Fsector** was built with the belief that security tools should be both powerful and elegant. Whether you are a blue teamer mapping your own infrastructure, a pentester conducting an authorized engagement, or a researcher studying anonymity networks, this tool is designed to give you precision without the noise.
+
+> *"The quieter you become, the more you are able to hear."* — Ram Dass
+
+**Use it wisely, use it legally, and stay invisible.**
+
+---
+
+<div align="center">
+
+**© 2026 richardQ1986 — Released under the MIT License.**
+
+[![Back to Top](https://img.shields.io/badge/%E2%AC%86%20Back%20to%20Top-000000?style=for-the-badge)](#-fsector)
+
+</div>
