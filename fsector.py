@@ -1,8 +1,8 @@
-
 #!/usr/bin/env python3
 """
 Fsector - Pentest tools over Tor
-A blue-team friendly wrapper around nmap via Tor SOCKS5.
+A blue-team friendly wrapper around nmap, nikto, and whatweb via Tor.
+Version 1.6.1 - Removed Nuclei, fixed DNS leak for web tools.
 """
 
 import os
@@ -13,6 +13,8 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import re
+import atexit
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Optional
@@ -33,7 +35,7 @@ except ImportError:
 
 
 APP_NAME = "Fsector"
-VERSION = "1.4"
+VERSION = "1.6.1"
 
 TOR_SOCKS_HOST = "127.0.0.1"
 TOR_SOCKS_PORT = 9050
@@ -44,6 +46,17 @@ ROTATION_WAIT = 15
 SENSITIVE_PORTS = {"22", "23", "445", "3389", "3306", "5432", "6379", "9200", "27017"}
 
 console = Console()
+
+_temp_files = []
+
+def _cleanup_temp():
+    for p in _temp_files:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+atexit.register(_cleanup_temp)
 
 BANNER = r"""
 ███████╗███████╗███████╗ ██████╗████████╗ ██████╗ ██████╗
@@ -56,6 +69,8 @@ BANNER = r"""
 
 TOOLS = {
     "1": {"name": "nmap", "desc": "Port & service scanner (via Tor)"},
+    "2": {"name": "nikto", "desc": "Web server vulnerability scanner (via Tor)"},
+    "3": {"name": "whatweb", "desc": "Web technology fingerprinting (via Tor)"},
 }
 
 SCAN_PLANS = {
@@ -128,7 +143,8 @@ def check_binary(name: str) -> bool:
 
 def preflight() -> bool:
     ok = True
-    for binary in ("tor", "proxychains4", "nmap", "curl"):
+    # فقط این ۶ تا ابزار رو چک می‌کنیم (nuclei حذف شد)
+    for binary in ("tor", "proxychains4", "nmap", "curl", "tor-resolve", "nikto", "whatweb"):
         if check_binary(binary):
             console.print(f"  [green]✓[/] {binary}")
         else:
@@ -251,7 +267,6 @@ def ensure_control_port() -> bool:
 
 
 def send_newnym() -> bool:
-    """Authenticate with Tor using cookie file, then send NEWNYM."""
     try:
         with open(TOR_COOKIE_PATH, "rb") as f:
             cookie_bytes = f.read()
@@ -265,7 +280,6 @@ def send_newnym() -> bool:
         console.print("  [red]✗[/] Permission denied reading cookie. Run with sudo.")
         return False
     except FileNotFoundError:
-        # No cookie — try passwordless AUTHENTICATE (works if auth is disabled)
         console.print("  [dim]No cookie file, trying passwordless auth...[/]")
         cookie_hex = ""
 
@@ -342,6 +356,50 @@ def get_exit_ip() -> str:
     return "unknown"
 
 
+def resolve_target_via_tor(target: str) -> Optional[str]:
+    if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", target):
+        return target
+
+    console.print(f"  [dim]Resolving {target} via Tor...[/]")
+    try:
+        result = subprocess.check_output(
+            ["tor-resolve", target],
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        ).decode().strip()
+
+        if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", result):
+            console.print(f"  [green]✓[/] Resolved to [cyan]{result}[/]")
+            return result
+        else:
+            console.print(f"  [yellow]![/] tor-resolve returned unexpected: {result}")
+            return None
+    except subprocess.TimeoutExpired:
+        console.print("  [red]✗[/] tor-resolve timed out")
+        return None
+    except FileNotFoundError:
+        console.print("  [red]✗[/] tor-resolve not found.")
+        return None
+    except subprocess.CalledProcessError as e:
+        console.print(f"  [red]✗[/] tor-resolve failed: {e}")
+        return None
+
+
+def validate_target(target: str) -> Optional[str]:
+    ipv4_re = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+    if ipv4_re.match(target):
+        parts = target.split(".")
+        if all(0 <= int(p) <= 255 for p in parts):
+            return None
+        return "Invalid IPv4 address (octet > 255)"
+
+    domain_re = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})*$")
+    if domain_re.match(target) and "." in target:
+        return None
+
+    return "Invalid target (not a valid IP or domain)"
+
+
 def write_proxychains_conf() -> str:
     fd, path = tempfile.mkstemp(prefix="fsector_", suffix=".conf")
     with os.fdopen(fd, "w") as f:
@@ -354,9 +412,11 @@ def write_proxychains_conf() -> str:
             "[ProxyList]\n"
             f"socks5 {TOR_SOCKS_HOST} {TOR_SOCKS_PORT}\n"
         )
+    _temp_files.append(path)
     return path
 
 
+# --- nmap ---
 def parse_nmap_xml(xml_str: str) -> list:
     root = ET.fromstring(xml_str)
     results = []
@@ -386,7 +446,7 @@ def parse_nmap_xml(xml_str: str) -> list:
 def run_nmap_via_tor(target: str, conf_path: str, plan: dict) -> tuple:
     cmd = [
         "proxychains4", "-f", conf_path, "-q",
-        "nmap", "-sT", "-Pn", "-oX", "-",
+        "nmap", "-sT", "-Pn", "-n", "-oX", "-",
         *plan["flags"],
         target,
     ]
@@ -407,12 +467,21 @@ def run_nmap_via_tor(target: str, conf_path: str, plan: dict) -> tuple:
     except subprocess.TimeoutExpired:
         console.print("[red]✗ Scan timed out[/]")
         return [], time.time() - start
+    except KeyboardInterrupt:
+        console.print("\n[yellow]![/] Scan interrupted by user")
+        return [], time.time() - start
 
     elapsed = time.time() - start
 
-    if proc.returncode != 0 and not proc.stdout.strip():
-        err = (proc.stderr or "").strip()[:500] or "unknown error"
-        console.print(f"[red]✗ nmap error:[/] {err}")
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()
+        if "proxychains" in err.lower():
+            console.print(f"[red]✗ proxychains error:[/] {err[:300]}")
+            console.print("[dim]Hint: is Tor running on :9050?[/]")
+        elif "nmap" in err.lower():
+            console.print(f"[red]✗ nmap error:[/] {err[:300]}")
+        else:
+            console.print(f"[red]✗ Scan failed:[/] {err[:300]}")
         return [], elapsed
 
     xml_out = proc.stdout
@@ -429,12 +498,124 @@ def run_nmap_via_tor(target: str, conf_path: str, plan: dict) -> tuple:
     return results, elapsed
 
 
+# --- nikto ---
+def run_nikto_via_tor(target: str, conf_path: str) -> tuple:
+    cmd = [
+        "proxychains4", "-f", conf_path, "-q",
+        "nikto", "-h", target, "-nointeractive", "-Format", "txt",
+    ]
+    console.print(f"[dim]$ {' '.join(cmd)}[/]")
+
+    start = time.time()
+    try:
+        with Progress(
+            SpinnerColumn("growVertical", style="bold cyan", speed=1.2),
+            TextColumn("[bold cyan]Running Nikto via Tor..."),
+            BarColumn(bar_width=None, style="cyan", complete_style="green"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            progress.add_task("scan", total=None)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    except subprocess.TimeoutExpired:
+        console.print("[red]✗ Nikto timed out[/]")
+        return [], time.time() - start
+    except KeyboardInterrupt:
+        console.print("\n[yellow]![/] Nikto interrupted by user")
+        return [], time.time() - start
+
+    elapsed = time.time() - start
+
+    if proc.returncode != 0 and not proc.stdout.strip():
+        err = (proc.stderr or "").strip()[:500] or "unknown error"
+        console.print(f"[red]✗ nikto error:[/] {err}")
+        return [], elapsed
+
+    output = proc.stdout.strip()
+    findings = []
+    for line in output.splitlines():
+        if line.startswith("+ ") and ":" in line:
+            findings.append(line[2:].strip())
+
+    results = [PortResult(
+        port="nikto",
+        protocol="-",
+        state="findings",
+        service=f"{len(findings)} findings",
+        version=output[:200] if len(output) > 200 else output,
+    )] if findings else []
+
+    return results, elapsed
+
+
+# --- whatweb ---
+def run_whatweb_via_tor(target: str, conf_path: str) -> tuple:
+    cmd = [
+        "proxychains4", "-f", conf_path, "-q",
+        "whatweb", "-a", "1", "--no-errors", "--log-json=-", target,
+    ]
+    console.print(f"[dim]$ {' '.join(cmd)}[/]")
+
+    start = time.time()
+    try:
+        with Progress(
+            SpinnerColumn("growVertical", style="bold cyan", speed=1.2),
+            TextColumn("[bold cyan]Running WhatWeb via Tor..."),
+            BarColumn(bar_width=None, style="cyan", complete_style="green"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            progress.add_task("scan", total=None)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        console.print("[red]✗ WhatWeb timed out[/]")
+        return [], time.time() - start
+    except KeyboardInterrupt:
+        console.print("\n[yellow]![/] WhatWeb interrupted by user")
+        return [], time.time() - start
+
+    elapsed = time.time() - start
+
+    if proc.returncode != 0 and not proc.stdout.strip():
+        err = (proc.stderr or "").strip()[:500] or "unknown error"
+        console.print(f"[red]✗ whatweb error:[/] {err}")
+        return [], elapsed
+
+    results = []
+    for line in proc.stdout.strip().splitlines():
+        try:
+            data = json.loads(line)
+            plugins = data.get("plugins", {})
+            techs = ", ".join(plugins.keys())[:100]
+            results.append(PortResult(
+                port="whatweb",
+                protocol="-",
+                state="detected",
+                service=techs or "none",
+                version=f"{len(plugins)} plugins",
+            ))
+        except json.JSONDecodeError:
+            continue
+
+    return results, elapsed
+
+
+# --- جدول و منو ---
 def style_state(state: str) -> str:
     return {
         "open":          "[bold green]🟢 open[/]",
         "closed":        "[bold red]🔴 closed[/]",
         "filtered":      "[bold yellow]🟡 filtered[/]",
         "open|filtered": "[bold yellow]🟡 open|filtered[/]",
+        "findings":      "[bold yellow]📋 findings[/]",
+        "detected":      "[bold cyan]🔎 detected[/]",
+        "critical":      "[bold red]🚨 critical[/]",
+        "high":          "[bold red]🔴 high[/]",
+        "medium":        "[bold yellow]🟡 medium[/]",
+        "low":           "[bold blue]🔵 low[/]",
+        "info":          "[dim]ℹ info[/]",
     }.get(state, state)
 
 
@@ -444,22 +625,24 @@ def style_port(port: str) -> str:
     return f"[green]{port}[/]"
 
 
-def render_table(summary: ScanSummary) -> None:
+def render_table(summary: ScanSummary, tool_name: str) -> None:
     open_count = sum(1 for p in summary.ports if p.state == "open")
     closed_count = sum(1 for p in summary.ports if p.state == "closed")
     filtered_count = sum(1 for p in summary.ports if "filtered" in p.state)
+    findings_count = sum(1 for p in summary.ports if p.state in ("findings", "detected", "critical", "high", "medium", "low", "info"))
 
     caption = (
         f"Target: [bold]{summary.target}[/]  ·  "
         f"Exit IP: [magenta]{summary.exit_ip}[/]  ·  "
         f"[green]{open_count} open[/] / "
         f"[red]{closed_count} closed[/] / "
-        f"[yellow]{filtered_count} filtered[/]  ·  "
+        f"[yellow]{filtered_count} filtered[/] / "
+        f"[cyan]{findings_count} findings[/]  ·  "
         f"[dim]{summary.elapsed:.1f}s[/]"
     )
 
     table = Table(
-        title="🔍 Scan Results via Tor",
+        title=f"🔍 {tool_name.upper()} Results via Tor",
         title_style="bold cyan",
         caption=caption,
         caption_style="dim",
@@ -467,16 +650,16 @@ def render_table(summary: ScanSummary) -> None:
         border_style="bright_blue",
         box=box.ROUNDED,
     )
-    table.add_column("Port", justify="center", no_wrap=True)
+    table.add_column("Port/Item", justify="center", no_wrap=True)
     table.add_column("State", justify="center", no_wrap=True)
     table.add_column("Service", style="cyan")
-    table.add_column("Version", style="white", overflow="fold")
+    table.add_column("Details", style="white", overflow="fold")
 
     shown = [p for p in summary.ports if p.state != "closed"]
     if not shown:
-        table.add_row("-", "[dim]no open ports[/]", "-", "-")
+        table.add_row("-", "[dim]no results[/]", "-", "-")
     else:
-        for p in sorted(shown, key=lambda x: int(x.port) if x.port.isdigit() else 0):
+        for p in shown:
             table.add_row(
                 style_port(p.port),
                 style_state(p.state),
@@ -580,6 +763,17 @@ def main() -> int:
                 target = target[len(prefix):].rstrip("/")
                 console.print(f"  [dim]→ using {target}[/]")
 
+        err = validate_target(target)
+        if err:
+            console.print(f"[red]✗ {err}[/]")
+            return 1
+
+        # Resolve target via Tor for ALL tools to prevent DNS leaks
+        resolved_ip = resolve_target_via_tor(target)
+        if not resolved_ip:
+            console.print("[red]✗ Could not resolve target via Tor. Aborting to prevent DNS leak.[/]")
+            return 1
+
         console.rule("[bold cyan]5/6 · Rotate identity before scan?")
         if control_ok:
             console.print(
@@ -622,34 +816,46 @@ def main() -> int:
         console.rule("[bold cyan]6/6 · Executing")
         conf = write_proxychains_conf()
         try:
-            ports, elapsed = run_nmap_via_tor(target, conf, plan)
+            if tool == "nmap":
+                ports, elapsed = run_nmap_via_tor(resolved_ip, conf, plan)
+            elif tool == "nikto":
+                ports, elapsed = run_nikto_via_tor(resolved_ip, conf)
+            elif tool == "whatweb":
+                ports, elapsed = run_whatweb_via_tor(resolved_ip, conf)
+            else:
+                console.print(f"[red]✗ Unknown tool: {tool}[/]")
+                return 1
         finally:
-            try:
-                os.unlink(conf)
-            except OSError:
-                pass
+            pass  # atexit will clean up
 
         summary = ScanSummary(
-            target=target,
+            target=f"{target} ({resolved_ip})" if resolved_ip != target else target,
             exit_ip=current_ip,
             elapsed=elapsed,
             ports=ports,
         )
-        render_table(summary)
+        render_table(summary, tool)
 
-        if Confirm.ask("\n[dim]Export results as JSON?[/]", default=False):
-            safe = target.replace(".", "_").replace("/", "_")
-            out_path = f"fsector_{safe}_{int(time.time())}.json"
-            with open(out_path, "w") as f:
-                json.dump({
-                    "tool": "nmap",
-                    "plan": plan["name"] if plan else None,
-                    "target": summary.target,
-                    "exit_ip": summary.exit_ip,
-                    "elapsed": round(summary.elapsed, 2),
-                    "ports": [p.__dict__ for p in summary.ports],
-                }, f, indent=2)
-            console.print(f"[green]✓[/] Saved to [cyan]{out_path}[/]")
+        safe = target.replace(".", "_").replace("/", "_").replace(":", "_")
+        default_path = f"fsector_{tool}_{safe}_{int(time.time())}.json"
+        with open(default_path, "w") as f:
+            json.dump({
+                "tool": tool,
+                "plan": plan["name"] if plan else None,
+                "target": summary.target,
+                "exit_ip": summary.exit_ip,
+                "elapsed": round(summary.elapsed, 2),
+                "results": [p.__dict__ for p in summary.ports],
+            }, f, indent=2)
+        console.print(f"[green]✓[/] Results saved to [cyan]{default_path}[/]")
+
+        if Confirm.ask("\n[dim]Save a copy elsewhere?[/]", default=False):
+            custom_path = Prompt.ask("  Path")
+            try:
+                shutil.copy(default_path, custom_path)
+                console.print(f"[green]✓[/] Copied to [cyan]{custom_path}[/]")
+            except Exception as e:
+                console.print(f"[red]✗ Copy failed: {e}[/]")
 
     finally:
         if tor_proc is not None:
