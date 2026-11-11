@@ -2,7 +2,7 @@
 """
 Fsector - Pentest tools over Tor
 A blue-team friendly wrapper around nmap, nikto, and whatweb via Tor.
-Version 1.6.1 - Removed Nuclei, fixed DNS leak for web tools.
+Version 1.6.2 - Bugfix release: NEWNYM ACK, web tool DNS, preflight, tor proc conflict.
 """
 
 import os
@@ -35,7 +35,7 @@ except ImportError:
 
 
 APP_NAME = "Fsector"
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 TOR_SOCKS_HOST = "127.0.0.1"
 TOR_SOCKS_PORT = 9050
@@ -43,6 +43,7 @@ TOR_CONTROL_PORT = 9051
 TOR_COOKIE_PATH = "/var/run/tor/control.authcookie"
 TOR_STARTUP_TIMEOUT = 30
 ROTATION_WAIT = 15
+ROTATION_MAX_WAIT = 45          # FIX #10: پویا تا این حد صبر می‌کنیم
 SENSITIVE_PORTS = {"22", "23", "445", "3389", "3306", "5432", "6379", "9200", "27017"}
 
 console = Console()
@@ -68,9 +69,12 @@ BANNER = r"""
 """
 
 TOOLS = {
-    "1": {"name": "nmap", "desc": "Port & service scanner (via Tor)"},
-    "2": {"name": "nikto", "desc": "Web server vulnerability scanner (via Tor)"},
-    "3": {"name": "whatweb", "desc": "Web technology fingerprinting (via Tor)"},
+    "1": {"name": "nmap",    "desc": "Port & service scanner (via Tor)",
+          "binaries": ["nmap"]},
+    "2": {"name": "nikto",   "desc": "Web server vulnerability scanner (via Tor)",
+          "binaries": ["nikto"]},
+    "3": {"name": "whatweb", "desc": "Web technology fingerprinting (via Tor)",
+          "binaries": ["whatweb"]},
 }
 
 SCAN_PLANS = {
@@ -141,10 +145,21 @@ def check_binary(name: str) -> bool:
     return shutil.which(name) is not None
 
 
-def preflight() -> bool:
+# FIX #4: preflight پویا — فقط ابزارهای موردنیاز همان اسکن
+def preflight(required: Optional[list] = None) -> bool:
+    """
+    اگر required داده شود، فقط همان باینری‌ها چک می‌شوند.
+    در غیر این صورت، پیش‌نیازهای پایه بررسی می‌شوند.
+    """
+    base = ["tor", "proxychains4", "curl", "tor-resolve"]
+    needed = list(base)
+    if required:
+        for b in required:
+            if b not in needed:
+                needed.append(b)
+
     ok = True
-    # فقط این ۶ تا ابزار رو چک می‌کنیم (nuclei حذف شد)
-    for binary in ("tor", "proxychains4", "nmap", "curl", "tor-resolve", "nikto", "whatweb"):
+    for binary in needed:
         if check_binary(binary):
             console.print(f"  [green]✓[/] {binary}")
         else:
@@ -170,9 +185,34 @@ def wait_for_port(host: str, port: int, timeout: int) -> bool:
     return False
 
 
+# FIX #9: start_tor دیگر پروسهٔ دستی نمی‌سازد اگر سرویس systemd فعال است
+def _tor_service_active() -> bool:
+    try:
+        r = subprocess.run(["systemctl", "is-active", "--quiet", "tor"],
+                           capture_output=True, text=True)
+        return r.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
 def start_tor() -> Optional[subprocess.Popen]:
     if port_is_open(TOR_SOCKS_HOST, TOR_SOCKS_PORT):
         console.print("  [dim]Tor already listening on :9050[/]")
+        return None
+
+    # FIX #9: اگر سرویس tor موجود است، از systemctl استفاده کن، نه پروسهٔ دستی
+    if _tor_service_active():
+        console.print("  [dim]Starting tor service via systemctl...[/]")
+        try:
+            subprocess.run(["systemctl", "start", "tor"], check=True,
+                           capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            console.print(f"  [red]✗[/] systemctl start tor failed: {e.stderr.strip()[:200]}")
+            return None
+        if wait_for_port(TOR_SOCKS_HOST, TOR_SOCKS_PORT, TOR_STARTUP_TIMEOUT):
+            console.print("  [green]✓[/] Tor service ready on :9050")
+            return None  # مالک پروسه نیستیم؛ در finally هم terminate نمی‌کنیم
+        console.print("  [red]✗[/] Tor service failed to open SOCKS port")
         return None
 
     console.print("  [dim]Launching tor...[/]")
@@ -266,7 +306,17 @@ def ensure_control_port() -> bool:
         return False
 
 
+# FIX #3: پاسخ NEWNYM را می‌خوانیم و تأیید می‌کنیم
+def _control_read(sock: socket.socket, size: int = 4096) -> bytes:
+    sock.settimeout(5)
+    try:
+        return sock.recv(size)
+    except socket.timeout:
+        return b""
+
+
 def send_newnym() -> bool:
+    cookie_hex = ""
     try:
         with open(TOR_COOKIE_PATH, "rb") as f:
             cookie_bytes = f.read()
@@ -281,47 +331,70 @@ def send_newnym() -> bool:
         return False
     except FileNotFoundError:
         console.print("  [dim]No cookie file, trying passwordless auth...[/]")
-        cookie_hex = ""
 
     try:
         with socket.create_connection((TOR_SOCKS_HOST, TOR_CONTROL_PORT), timeout=3) as s:
+            # مرحله ۱: احراز هویت
             if cookie_hex:
-                cmd = f"AUTHENTICATE {cookie_hex}\r\nSIGNAL NEWNYM\r\nQUIT\r\n"
+                s.sendall(f"AUTHENTICATE {cookie_hex}\r\n".encode())
             else:
-                cmd = "AUTHENTICATE\r\nSIGNAL NEWNYM\r\nQUIT\r\n"
-            s.sendall(cmd.encode())
-            time.sleep(2)
-        return True
+                s.sendall(b"AUTHENTICATE\r\n")
+            auth_resp = _control_read(s)
+            if not auth_resp.startswith(b"250"):
+                console.print(f"  [red]✗[/] AUTHENTICATE failed: {auth_resp[:120]!r}")
+                return False
+
+            # مرحله ۲: SIGNAL NEWNYM
+            s.sendall(b"SIGNAL NEWNYM\r\n")
+            newnym_resp = _control_read(s)
+            if not newnym_resp.startswith(b"250"):
+                console.print(f"  [red]✗[/] NEWNYM failed: {newnym_resp[:120]!r}")
+                return False
+
+            s.sendall(b"QUIT\r\n")
+            return True
     except OSError as e:
         console.print(f"  [red]✗[/] Socket error: {e}")
         return False
 
 
-def rotate_and_wait(wait_seconds: int = ROTATION_WAIT) -> tuple:
+# FIX #10: صبر پویا تا تغییر IP (با timeout سخت)
+def rotate_and_wait(min_seconds: int = ROTATION_WAIT,
+                    max_seconds: int = ROTATION_MAX_WAIT) -> tuple:
     old_ip = get_exit_ip()
 
     if not send_newnym():
         return False, old_ip, old_ip
 
+    console.print(f"  [dim]Waiting for new circuit (min {min_seconds}s, max {max_seconds}s)...[/]")
+
+    new_ip = old_ip
+    start = time.time()
     with Progress(
         SpinnerColumn("growVertical", style="bold cyan", speed=1.0),
         TextColumn("[bold cyan]Building new Tor circuits"),
         TextColumn("[dim]·[/]"),
-        TextColumn("[green]{task.fields[remaining]}s remaining[/]"),
+        TextColumn("[green]{task.fields[elapsed]}s[/]"),
         console=console,
         transient=True,
     ) as progress:
-        task = progress.add_task(
-            "rotate",
-            total=wait_seconds,
-            remaining=wait_seconds,
-        )
-        for i in range(wait_seconds):
+        task = progress.add_task("rotate", total=None, elapsed=0)
+        while True:
+            elapsed = int(time.time() - start)
+            progress.update(task, elapsed=elapsed)
             time.sleep(1)
-            progress.update(task, remaining=wait_seconds - (i + 1))
-            progress.advance(task)
+            elapsed = int(time.time() - start)
 
-    new_ip = get_exit_ip()
+            # حداقل زمان را صبر می‌کنیم، بعد IP را چک می‌کنیم
+            if elapsed < min_seconds:
+                continue
+
+            new_ip = get_exit_ip()
+            if new_ip != "unknown" and new_ip != old_ip:
+                break
+            if elapsed >= max_seconds:
+                break
+
     return True, old_ip, new_ip
 
 
@@ -356,11 +429,12 @@ def get_exit_ip() -> str:
     return "unknown"
 
 
+# FIX #1: tor-resolve فقط برای اعتبارسنجی؛ نام دامنه برای ابزارهای وب حفظ می‌شود
 def resolve_target_via_tor(target: str) -> Optional[str]:
     if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", target):
         return target
 
-    console.print(f"  [dim]Resolving {target} via Tor...[/]")
+    console.print(f"  [dim]Validating DNS for {target} via Tor...[/]")
     try:
         result = subprocess.check_output(
             ["tor-resolve", target],
@@ -369,7 +443,7 @@ def resolve_target_via_tor(target: str) -> Optional[str]:
         ).decode().strip()
 
         if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", result):
-            console.print(f"  [green]✓[/] Resolved to [cyan]{result}[/]")
+            console.print(f"  [green]✓[/] DNS OK (resolved via Tor: [cyan]{result}[/])")
             return result
         else:
             console.print(f"  [yellow]![/] tor-resolve returned unexpected: {result}")
@@ -385,6 +459,7 @@ def resolve_target_via_tor(target: str) -> Optional[str]:
         return None
 
 
+# FIX #5: دامنه‌های تک‌برچسبی و localhost پذیرفته می‌شوند
 def validate_target(target: str) -> Optional[str]:
     ipv4_re = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
     if ipv4_re.match(target):
@@ -393,8 +468,9 @@ def validate_target(target: str) -> Optional[str]:
             return None
         return "Invalid IPv4 address (octet > 255)"
 
+    # برچسب‌های تک (localhost, intranet) + دامنه‌های چندبرچسبی + کاراکترهای مجاز
     domain_re = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})*$")
-    if domain_re.match(target) and "." in target:
+    if domain_re.match(target):
         return None
 
     return "Invalid target (not a valid IP or domain)"
@@ -417,6 +493,7 @@ def write_proxychains_conf() -> str:
 
 
 # --- nmap ---
+# FIX #8: فقط پورت‌های باز/فیلترشده برگردانده می‌شوند (closed حذف)
 def parse_nmap_xml(xml_str: str) -> list:
     root = ET.fromstring(xml_str)
     results = []
@@ -424,6 +501,10 @@ def parse_nmap_xml(xml_str: str) -> list:
         state_el = port.find("state")
         service_el = port.find("service")
         state = state_el.get("state") if state_el is not None else "unknown"
+
+        # closed را نگه نمی‌داریم تا JSON سبک بماند
+        if state == "closed":
+            continue
 
         service = "-"
         version = "-"
@@ -499,6 +580,7 @@ def run_nmap_via_tor(target: str, conf_path: str, plan: dict) -> tuple:
 
 
 # --- nikto ---
+# FIX #1: نام دامنه ارسال می‌شود (نه IP)؛ FIX #6: پارس بهتر
 def run_nikto_via_tor(target: str, conf_path: str) -> tuple:
     cmd = [
         "proxychains4", "-f", conf_path, "-q",
@@ -535,25 +617,45 @@ def run_nikto_via_tor(target: str, conf_path: str) -> tuple:
     output = proc.stdout.strip()
     findings = []
     for line in output.splitlines():
-        if line.startswith("+ ") and ":" in line:
-            findings.append(line[2:].strip())
+        s = line.strip()
+        # FIX #6: خطوط + و - و هشدارها را بگیر (نه فقط + با :)
+        if s.startswith("+ ") or s.startswith("- "):
+            text = s[2:].strip()
+            if text and not text.lower().startswith(("target ip", "target hostname",
+                                                     "target port", "start time",
+                                                     "end time", "server:", "no cgi")):
+                findings.append(text)
+
+    # FIX #6: version به‌جای ۲۰۰ کاراکتر خام، خلاصهٔ معنادار
+    details = f"{len(findings)} findings"
+    if findings:
+        preview = " | ".join(findings[:3])
+        if len(findings) > 3:
+            preview += f" (+{len(findings) - 3} more)"
+        details = preview[:300]
 
     results = [PortResult(
         port="nikto",
         protocol="-",
-        state="findings",
-        service=f"{len(findings)} findings",
-        version=output[:200] if len(output) > 200 else output,
-    )] if findings else []
+        state="findings" if findings else "info",
+        service=f"{len(findings)} findings" if findings else "no findings",
+        version=details,
+    )] if output else []
 
     return results, elapsed
 
 
 # --- whatweb ---
+# FIX #1: نام دامنه؛ FIX #7: از فایل موقت برای JSON استفاده می‌کنیم تا آلودگی proxychains مشکل نسازد
 def run_whatweb_via_tor(target: str, conf_path: str) -> tuple:
+    fd, json_path = tempfile.mkstemp(prefix="fsector_whatweb_", suffix=".json")
+    os.close(fd)
+    _temp_files.append(json_path)
+
     cmd = [
         "proxychains4", "-f", conf_path, "-q",
-        "whatweb", "-a", "1", "--no-errors", "--log-json=-", target,
+        "whatweb", "-a", "1", "--no-errors",
+        "--log-json", json_path, target,
     ]
     console.print(f"[dim]$ {' '.join(cmd)}[/]")
 
@@ -583,8 +685,23 @@ def run_whatweb_via_tor(target: str, conf_path: str) -> tuple:
         console.print(f"[red]✗ whatweb error:[/] {err}")
         return [], elapsed
 
+    # FIX #7: خواندن از فایل، نه stdout (که ممکن است با پیام proxychains آلوده شود)
+    raw = ""
+    try:
+        with open(json_path, "r") as f:
+            raw = f.read().strip()
+    except OSError:
+        pass
+
+    if not raw:
+        console.print("  [yellow]![/] whatweb produced no JSON output")
+        return [], elapsed
+
     results = []
-    for line in proc.stdout.strip().splitlines():
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
             data = json.loads(line)
             plugins = data.get("plugins", {})
@@ -597,6 +714,8 @@ def run_whatweb_via_tor(target: str, conf_path: str) -> tuple:
                 version=f"{len(plugins)} plugins",
             ))
         except json.JSONDecodeError:
+            # FIX #7: هشدار می‌دهیم تا کاربر بداند چیزی از دست رفته
+            console.print(f"  [dim]skip non-JSON line: {line[:80]}[/]")
             continue
 
     return results, elapsed
@@ -619,8 +738,9 @@ def style_state(state: str) -> str:
     }.get(state, state)
 
 
+# FIX #14: فقط برای پورت‌های عددی nmap؛ برای nikto/whatweb اعمال نمی‌شود
 def style_port(port: str) -> str:
-    if port in SENSITIVE_PORTS:
+    if port.isdigit() and port in SENSITIVE_PORTS:
         return f"[bold red]{port}[/]"
     return f"[green]{port}[/]"
 
@@ -718,8 +838,9 @@ def main() -> int:
     show_banner_animated()
 
     console.rule("[bold cyan]1/6 · Preflight")
+    # FIX #4: ابتدا فقط پیش‌نیازهای پایه، بعد از انتخاب ابزار، باینری اختصاصی چک می‌شود
     if not preflight():
-        console.print("\n[red]Missing dependencies. Run:[/]")
+        console.print("\n[red]Missing base dependencies. Run:[/]")
         console.print("  [yellow]sudo bash install.sh[/]")
         return 1
 
@@ -734,7 +855,7 @@ def main() -> int:
         control_ok = ensure_control_port()
 
         if control_ok and send_newnym():
-            console.print("  [green]✓[/] NEWNYM signal sent")
+            console.print("  [green]✓[/] NEWNYM acknowledged by Tor")
         else:
             console.print("  [yellow]![/] IP rotation disabled (ControlPort unavailable)")
 
@@ -746,6 +867,11 @@ def main() -> int:
 
         console.rule("[bold cyan]4/6 · Configure scan")
         tool = choose_tool()
+
+        # FIX #4: چک باینری اختصاصی همان ابزار
+        if not preflight(TOOLS[[k for k, v in TOOLS.items() if v["name"] == tool][0]]["binaries"]):
+            console.print(f"[red]✗ Missing binary for {tool}. Aborting.[/]")
+            return 1
 
         plan = None
         if tool == "nmap":
@@ -768,11 +894,16 @@ def main() -> int:
             console.print(f"[red]✗ {err}[/]")
             return 1
 
-        # Resolve target via Tor for ALL tools to prevent DNS leaks
+        # FIX #1: DNS را با Tor اعتبارسنجی می‌کنیم، اما برای ابزارهای وب نام دامنه را نگه می‌داریم
         resolved_ip = resolve_target_via_tor(target)
         if not resolved_ip:
             console.print("[red]✗ Could not resolve target via Tor. Aborting to prevent DNS leak.[/]")
             return 1
+
+        # انتخاب هدفی که به ابزار داده می‌شود
+        scan_target = resolved_ip if tool == "nmap" else target
+        if tool != "nmap":
+            console.print(f"  [dim]Passing hostname to {tool} (DNS tunneled via proxychains)[/]")
 
         console.rule("[bold cyan]5/6 · Rotate identity before scan?")
         if control_ok:
@@ -781,20 +912,23 @@ def main() -> int:
                 f"but it takes ~{ROTATION_WAIT}s to build.[/]"
             )
             do_rotate = Confirm.ask(
-                f"  Rotate IP now and wait {ROTATION_WAIT}s before scanning?",
+                f"  Rotate IP now and wait up to {ROTATION_MAX_WAIT}s before scanning?",
                 default=True,
             )
 
             if do_rotate:
                 console.print("  [dim]Requesting new identity from Tor...[/]")
-                success, old_ip, new_ip = rotate_and_wait(ROTATION_WAIT)
+                success, old_ip, new_ip = rotate_and_wait(ROTATION_WAIT, ROTATION_MAX_WAIT)
 
                 if not success:
                     console.print("  [red]✗[/] Rotation failed")
                     if not Confirm.ask("  Continue with current IP?", default=True):
                         return 1
                 elif old_ip == new_ip and new_ip != "unknown":
-                    console.print(f"  [yellow]![/] Tor reused IP: {new_ip}")
+                    # FIX #2: پیام دقیق‌تر — ممکن است Tor مدار جدید ساخته باشد ولی IP یکی باشد
+                    console.print(f"  [yellow]![/] Exit IP unchanged: {new_ip} (new circuit may share exit)")
+                elif old_ip == new_ip == "unknown":
+                    console.print("  [yellow]![/] Could not verify IP before/after rotation")
                 else:
                     console.print(
                         f"  [green]✓[/] Exit IP changed: "
@@ -815,18 +949,16 @@ def main() -> int:
 
         console.rule("[bold cyan]6/6 · Executing")
         conf = write_proxychains_conf()
-        try:
-            if tool == "nmap":
-                ports, elapsed = run_nmap_via_tor(resolved_ip, conf, plan)
-            elif tool == "nikto":
-                ports, elapsed = run_nikto_via_tor(resolved_ip, conf)
-            elif tool == "whatweb":
-                ports, elapsed = run_whatweb_via_tor(resolved_ip, conf)
-            else:
-                console.print(f"[red]✗ Unknown tool: {tool}[/]")
-                return 1
-        finally:
-            pass  # atexit will clean up
+        # FIX #11: try/finally بی‌معنی حذف شد؛ atexit مسئول پاک‌سازی است
+        if tool == "nmap":
+            ports, elapsed = run_nmap_via_tor(scan_target, conf, plan)
+        elif tool == "nikto":
+            ports, elapsed = run_nikto_via_tor(scan_target, conf)
+        elif tool == "whatweb":
+            ports, elapsed = run_whatweb_via_tor(scan_target, conf)
+        else:
+            console.print(f"[red]✗ Unknown tool: {tool}[/]")
+            return 1
 
         summary = ScanSummary(
             target=f"{target} ({resolved_ip})" if resolved_ip != target else target,
